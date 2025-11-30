@@ -1,144 +1,202 @@
-// Здесь реализовано:
-// 1) Остановка, полив и удобрение при срабатывании индуктивного датчика (SN04-N)
-// 2) Движение вперёд по умолчанию
-// 3) Поворот на 90 градусов вправо при исчезновении стены слева по ИК-датчику
-// Не реализовано: выезд/старт в заданное время
+// -------- Пины --------
 
-// --- Пины исполнительных устройств ---
-int water       = 9;   // помпа воды
-int fert        = 8;   // помпа удобрений
+// ЛЕВЫЙ мотор
+const int RELAY_LEFT_PIN = 22;
+const int PWM_LEFT_PIN   = 4;
+const int DIR_LEFT_PIN   = 2;
 
-int left_speed  = A0;  // управление скоростью левого мотора
-int right_speed = A1;  // управление скоростью правого мотора
-int left_dir    = 7;   // направление левого мотора
-int right_dir   = 6;   // направление правого мотора
+// ПРАВЫЙ мотор
+const int RELAY_RIGHT_PIN = 18;
+const int PWM_RIGHT_PIN   = 5;
+// направление правого мотора посажено на GND проводом
 
-// --- Датчики ---
-int induction   = 2;   // ИНДУКТИВНЫЙ ДАТЧИК SN04-N (цифровой выход, NPN, активный LOW)
-int ir_sensor   = A3;  // ИК-датчик расстояния (аналоговый, слева)
+// Индуктивный датчик 
+const int SENSOR_METAL_PIN = 15;
 
-// --- Константы поведения робота ---
-int IR_THRESHOLD = 700;   // чем выше значение, тем ближе стена (подбирается экспериментально)
-// при падении значения ниже IR_THRESHOLD, считаем, что стена слева исчезла
-int TURN_DELAY   = 800;   // длительность поворота (мс), подбирается по опыту
+// ИК-датчик стены
+const int IR_WALL_PIN = 12;
+
+// Помпы (реле)
+const int PUMP1_PIN = 14;
+const int PUMP2_PIN = 27;
+
+// -------- Настройки --------
+
+const int SPEED_LEFT  = 255;
+const int SPEED_RIGHT = 255;
+
+// Реле считаем active-LOW (IN = LOW -> включено).
+const bool RELAY_ACTIVE_LOW = true;
+
+// Металл: можно ли сейчас запускать последовательность с помпами
+bool canTriggerMetal = true;
+
+// -------- Вспомогательные функции для реле --------
+
+void relayOn(int pin) {
+  digitalWrite(pin, RELAY_ACTIVE_LOW ? LOW : HIGH);
+}
+
+void relayOff(int pin) {
+  digitalWrite(pin, RELAY_ACTIVE_LOW ? HIGH : LOW);
+}
+
+// -------- Моторы --------
+
+void stopMotors() {
+  analogWrite(PWM_LEFT_PIN,  0);
+  analogWrite(PWM_RIGHT_PIN, 0);
+
+  relayOff(RELAY_LEFT_PIN);
+  relayOff(RELAY_RIGHT_PIN);
+}
+
+void driveForwardBoth() {
+  // левый: нужное направление
+  pinMode(DIR_LEFT_PIN, OUTPUT);
+  digitalWrite(DIR_LEFT_PIN, LOW);
+
+  relayOn(RELAY_LEFT_PIN);
+  relayOn(RELAY_RIGHT_PIN);
+
+  analogWrite(PWM_LEFT_PIN,  SPEED_LEFT);
+  analogWrite(PWM_RIGHT_PIN, SPEED_RIGHT);
+}
+
+// поворот: едет только левое колесо (правое стоит)
+void driveLeftOnly() {
+  pinMode(DIR_LEFT_PIN, OUTPUT);
+  digitalWrite(DIR_LEFT_PIN, LOW);
+
+  relayOn(RELAY_LEFT_PIN);
+  analogWrite(PWM_LEFT_PIN, SPEED_LEFT);
+
+  analogWrite(PWM_RIGHT_PIN, 0);
+  relayOff(RELAY_RIGHT_PIN);
+}
+
+// -------- Помпы --------
+
+void pump1On()  { relayOn(PUMP1_PIN); }
+void pump1Off() { relayOff(PUMP1_PIN); }
+
+void pump2On()  { relayOn(PUMP2_PIN); }
+void pump2Off() { relayOff(PUMP2_PIN); }
+
+// последовательность при металле: стоп -> помпа1 5с -> помпа2 5с
+void runPumpSequence() {
+  stopMotors();
+
+  pump1On();
+  delay(5000);
+  pump1Off();
+
+  pump2On();
+  delay(5000);
+  pump2Off();
+}
+
+// -------- Чтение датчиков --------
+
+bool isMetalDetected() {
+  int raw = digitalRead(SENSOR_METAL_PIN);
+  // SN04-N: при металле тянет на GND
+  return (raw == LOW);
+}
+
+// предполагаем, что ИК-датчик даёт LOW, когда "видит стену"
+bool isWallSeen() {
+  int raw = digitalRead(IR_WALL_PIN);
+  bool wall = (raw == LOW);
+  return wall;
+
+  // если HIGH = стена, поменять на:
+  // bool wall = (raw == HIGH);
+}
+
+// -------- Логика ИК-датчика (стены) --------
+
+// Управляет режимами движения: прямой ход / поворот
+void handleIRLogic() {
+  static bool lastWall = true;   // прошлое состояние: стена была/нет
+  static bool turning  = false;  // сейчас крутимся одним колесом?
+
+  bool wall = isWallSeen();
+
+  if (wall) {
+    // стена есть: едем двумя колёсами вперёд
+    if (!lastWall || turning) {
+      driveForwardBoth();
+      turning = false;
+      Serial.println("IR: WALL -> DRIVE BOTH");
+    }
+  } else {
+    // стены нет: один раз при переходе остановиться и начать поворот
+    if (lastWall) {
+      Serial.println("IR: NO WALL -> STOP 3s, THEN TURN");
+      stopMotors();
+      delay(3000);
+      driveLeftOnly();
+      turning = true;
+    } else {
+      // продолжаем поворот
+      if (!turning) {
+        driveLeftOnly();
+        turning = true;
+        Serial.println("IR: KEEP TURNING");
+      }
+    }
+  }
+
+  lastWall = wall;
+}
+
+// -------- setup / loop --------
 
 void setup() {
-  // Помпы
-  pinMode(water, OUTPUT);
-  pinMode(fert, OUTPUT);
+  // моторы
+  pinMode(RELAY_LEFT_PIN,  OUTPUT);
+  pinMode(RELAY_RIGHT_PIN, OUTPUT);
+  pinMode(PWM_LEFT_PIN,    OUTPUT);
+  pinMode(PWM_RIGHT_PIN,   OUTPUT);
 
-  // Моторы
-  pinMode(left_speed,  OUTPUT);
-  pinMode(right_speed, OUTPUT);
-  pinMode(left_dir,    OUTPUT);
-  pinMode(right_dir,   OUTPUT);
+  // помпы
+  pinMode(PUMP1_PIN, OUTPUT);
+  pinMode(PUMP2_PIN, OUTPUT);
+  relayOff(PUMP1_PIN);
+  relayOff(PUMP2_PIN);
 
-  // Датчик индукции SN04-N:
-  // SN04-N — открытый коллектор, замыкает выход на GND при срабатывании.
-  // Поэтому включаем внутреннюю подтяжку к +5 В.
-  // Подключение:
-  //   коричневый -> +5 В (VCC)
-  //   синий      -> GND
-  //   чёрный     -> D2 (сюда, на пин "induction")
-  pinMode(induction, INPUT_PULLUP);
+  // датчики
+  pinMode(SENSOR_METAL_PIN, INPUT_PULLUP);  // SN04-N
+  pinMode(IR_WALL_PIN,      INPUT);        // ИК-датчик
 
-  // ИК-датчик как аналоговый вход
-  pinMode(ir_sensor, INPUT);
+  Serial.begin(9600);
 
-  // Включаем Serial для отладки (по желанию можно убрать)
-  Serial.begin(115200);
-}
-
-// Полная остановка моторов
-void stopMotors() {
-  digitalWrite(left_speed,  LOW);
-  digitalWrite(right_speed, LOW);
-}
-
-// Движение вперёд
-void moveForward() {
-  // направление вперёд для обоих моторов
-  digitalWrite(left_dir,  HIGH);
-  digitalWrite(right_dir, HIGH);
-  // включаем оба мотора
-  digitalWrite(left_speed,  HIGH);
-  digitalWrite(right_speed, HIGH);
-}
-
-// Небольшое движение вперёд, чтобы отъехать от растения/датчика после полива
-void moveForwardShort() {
-  moveForward();
-  delay(1000);  // время подбирается по факту
-  // можно добавить stopMotors(), если нужно реально остановиться
-  // stopMotors();
-}
-
-// Поворот направо на месте
-void turnRight() {
-  // Левое колесо вперёд, правое назад — робот поворачивает направо
-  digitalWrite(left_dir,  HIGH);  // левый мотор вперёд
-  digitalWrite(right_dir, LOW);   // правый мотор назад
-
-  digitalWrite(left_speed,  HIGH);
-  digitalWrite(right_speed, HIGH);
-
-  delay(TURN_DELAY);  // реально калибруем этот параметр в поле
-
-  stopMotors();
-  moveForwardShort(); // чтобы выйти из угла/от стены
-}
-
-// Последовательность "полив + удобрение" на месте
-void waterAndFertilize() {
-  // Сначала полив
-  digitalWrite(water, HIGH);
-  delay(3000);             // длительность полива (мс)
-  digitalWrite(water, LOW);
-
-  // Затем удобрение
-  digitalWrite(fert, HIGH);
-  delay(2000);             // длительность подачи удобрений (мс)
-  digitalWrite(fert, LOW);
+  // старт: считаем, что стену видим -> едем двумя
+  driveForwardBoth();
 }
 
 void loop() {
-  // --- Считываем датчики ---
+  // --- металл + помпы ---
+  bool metal = isMetalDetected();
 
-  // Индуктивный датчик SN04-N:
-  // digitalRead(induction) вернёт:
-  //   HIGH (1) — металла нет (датчик отпущен, пин подтянут к +5 В)
-  //   LOW  (0) — металл есть под датчиком (SN04-N тянет выход к GND)
-  int ind_raw = digitalRead(induction);
+  if (metal && canTriggerMetal) {
+    Serial.println("METAL: START PUMP SEQUENCE");
+    canTriggerMetal = false;
 
-  // Приводим к логической переменной: true = есть растение/металл
-  bool plant_detected = (ind_raw == LOW);
+    runPumpSequence();   // блокирующие 10 секунд
 
-  // ИК-датчик расстояния — аналоговый (0..1023)
-  int ir = analogRead(ir_sensor);
-
-  // Отладочный вывод (закоментировать после колибровки для того, чтобы не засорять Serial)
-  Serial.print("IND=");
-  Serial.print(plant_detected ? 1 : 0);
-  Serial.print("  IR=");
-  Serial.println(ir);
-
-  // --- Базовое поведение: робот едет вперёд ---
-  moveForward();
-
-  // --- 1) Срабатывание индукционного датчика — полив и удобрение ---
-  if (plant_detected) {
-    stopMotors();          // остановка у растения
-    waterAndFertilize();   // полив + удобрение
-    moveForwardShort();    // чуть отъехать от растения/датчика
+    Serial.println("METAL: PUMP SEQUENCE DONE");
+    // после помп дальше рулит ИК-логика
   }
 
-  // --- 2) Исчезновение стены слева — поворот направо ---
-  // Если ИК-датчик показывает значение сильно меньше нормы,
-  // считаем, что «стена ушла» и нужно повернуть в новый ряд.
-  else if (ir < IR_THRESHOLD / 3) {
-    // Коэффициент (1/3) подбирается экспериментально под конкретный ИК-датчик
-    turnRight();
+  if (!metal) {
+    // металл ушёл -> можно снова триггерить в будущем
+    canTriggerMetal = true;
   }
 
-  // Если ни одно условие не сработало — робот просто продолжает ехать вперёд
+  // --- логика стены/поворота ---
+  handleIRLogic();
+
+  delay(50);
 }
